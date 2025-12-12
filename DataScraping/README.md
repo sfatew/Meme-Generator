@@ -107,7 +107,7 @@ project/
     ├── Bo/                   # Bo characters
     ├── Gau/                  # Gau characters
     ├── Others/               # Other characters
-    ├── .discarded/           # Discarded images
+    ├── Discarded/           # Discarded images
     └── sorting_metadata.json # Tracking file
 ```
 

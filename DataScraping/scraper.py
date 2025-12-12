@@ -1,5 +1,5 @@
 """
-meme_scraper.py - Download memes from bovagau.vn
+meme_scraper.py - Download memes from bovagau.vn (Fixed version)
 """
 import os
 import time
@@ -10,7 +10,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
 from datetime import datetime
 
 class MemeScraper:
@@ -93,10 +93,18 @@ class MemeScraper:
         """
         # Check if already downloaded
         if not force and str(meme_id) in self.metadata:
-            existing_path = Path(self.metadata[str(meme_id)]['path'])
-            if existing_path.exists():
-                print(f"⊙ Meme {meme_id} already downloaded: {existing_path}")
-                return existing_path
+            metadata_entry = self.metadata[str(meme_id)]
+            path_value = metadata_entry.get('path')
+            
+            # Only try to use existing path if it's not None and status is success
+            if path_value and metadata_entry.get('status') == 'success':
+                existing_path = Path(path_value)
+                if existing_path.exists():
+                    print(f"⊙ Meme {meme_id} already downloaded: {existing_path}")
+                    return existing_path
+            elif metadata_entry.get('status') == 'skipped':
+                print(f"⊙ Meme {meme_id} previously skipped (no image)")
+                return 'skipped'
         
         url = f"https://bovagau.vn/meme/{meme_id}"
         print(f"\nAccessing meme ID: {meme_id}")
@@ -133,9 +141,19 @@ class MemeScraper:
             # Get list of files before download
             before_files = set(self.download_dir.glob("*"))
             
-            # Click download button
-            download_button.click()
-            print("✓ Clicked download button")
+            # Click download button (with fallback)
+            try:
+                # 1. Scroll element to center to avoid headers/tabs covering it
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", download_button)
+                time.sleep(0.5) # Allow scroll to settle
+                
+                download_button.click()
+                print("✓ Clicked download button")
+            except (ElementClickInterceptedException, Exception):
+                # 2. If standard click is still intercepted, FORCE it with JavaScript
+                print("! Standard click intercepted, forcing with JS...")
+                self.driver.execute_script("arguments[0].click();", download_button)
+                print("✓ Clicked download button (via JS)")
             
             # Wait for download to complete (check for new file)
             timeout = 30
@@ -237,7 +255,7 @@ class MemeScraper:
             force: Force re-download of existing memes
             
         Returns:
-            Dictionary mapping meme_id to file path (or status)
+            Dictionary mapping meme_id to file path (only successful downloads)
         """
         print(f"\n{'='*60}")
         print(f"Downloading {count} memes starting from ID {start_id}")
@@ -337,24 +355,3 @@ class MemeScraper:
         if self.driver:
             self.driver.quit()
             print("\n✓ Cleaned up resources")
-
-# # Example usage
-# if __name__ == "__main__":
-#     scraper = MemeScraper(download_dir="meme_downloads")
-    
-#     try:
-#         # Download first 10 memes
-#         results = scraper.download_batch(start_id=0, count=10, delay=2)
-        
-#         # Check statistics
-#         print(f"\nSuccessfully downloaded: {len(scraper.get_downloaded_memes())} memes")
-#         print(f"Skipped (no image): {len(scraper.get_skipped_memes())} memes")
-        
-#         # Or download specific memes
-#         # results = scraper.download_list([5, 10, 15, 20])
-        
-#         # Or download single meme
-#         # path = scraper.download_meme(42)
-        
-#     finally:
-#         scraper.cleanup()

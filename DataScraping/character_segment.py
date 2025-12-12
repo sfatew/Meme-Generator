@@ -7,14 +7,16 @@ from pathlib import Path
 import torch
 import numpy as np
 from PIL import Image
-from transformers import AutoProcessor, AutoModel
+from transformers.models.sam3 import Sam3Processor, Sam3Model
+from huggingface_hub import login, whoami
 
 class CharacterSegmenter:
     def __init__(
         self, 
         output_dir="character_crops",
         model_name="facebook/sam3",
-        device=None
+        device=None,
+        hf_token=None
     ):
         """
         Initialize the character segmenter with SAM3
@@ -33,6 +35,7 @@ class CharacterSegmenter:
         
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.hf_token = hf_token
         
         # Setup SAM3
         self.processor = None
@@ -46,6 +49,29 @@ class CharacterSegmenter:
                 return json.load(f)
         return {}
     
+    def ensure_hf_login(self):
+        """Ensure user is logged in to Hugging Face"""
+        try:
+            # Check if user is already logged in
+            user_info = whoami()
+            print(f"✓ Logged in to Hugging Face as: {user_info['name']}")
+            return True
+        except Exception:
+            # If token is provided, use it
+            if self.hf_token:
+                try:
+                    login(token=self.hf_token)
+                    print("✓ Successfully logged in to Hugging Face with provided token")
+                    return True
+                except Exception as e:
+                    print(f"✗ Error during login with provided token: {e}")
+                    return False
+            else:
+                print("⚠ No Hugging Face token provided")
+                print("SAM3 model requires Hugging Face authentication.")
+                print("Please provide a token via the UI or set hf_token parameter.")
+                return False
+    
     def save_metadata(self):
         """Save metadata to file"""
         with open(self.metadata_file, 'w', encoding='utf-8') as f:
@@ -55,48 +81,32 @@ class CharacterSegmenter:
         """Initialize SAM3 model from Hugging Face"""
         print(f"Loading SAM3 model from Hugging Face: {self.model_name}")
         
+        # Ensure HF authentication
+        self.ensure_hf_login()
+        
         try:
-            # Load processor and model
-            self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = AutoModel.from_pretrained(self.model_name).to(self.device)
+            # Load processor and model specifically for SAM3
+            self.processor = Sam3Processor.from_pretrained(self.model_name)
+            self.model = Sam3Model.from_pretrained(self.model_name).to(self.device)
             self.model.eval()
             
             print(f"✓ SAM3 model loaded on {self.device}")
             
         except Exception as e:
             print(f"✗ Error loading SAM3: {e}")
-            print("Note: SAM3 requires authentication. Run: huggingface-cli login")
+            print("Note: Make sure you are authenticated with Hugging Face")
     
-    def generate_point_grid(self, width, height, grid_size=8):
+    def segment_with_text_prompt(self, image, prompt="character", threshold=0.5):
         """
-        Generate a grid of points for prompting
-        
-        Args:
-            width: Image width
-            height: Image height
-            grid_size: Number of points per dimension
-            
-        Returns:
-            List of (x, y) coordinates
-        """
-        points = []
-        for i in range(1, grid_size + 1):
-            for j in range(1, grid_size + 1):
-                x = int(width * i / (grid_size + 1))
-                y = int(height * j / (grid_size + 1))
-                points.append([x, y])
-        return points
-    
-    def segment_with_text_prompt(self, image, prompt="character"):
-        """
-        Segment using text prompt
+        Segment using text prompt and post-process results
         
         Args:
             image: PIL Image
             prompt: Text prompt for segmentation
+            threshold: Confidence threshold
             
         Returns:
-            List of masks
+            Dictionary containing 'masks', 'boxes', 'scores'
         """
         # Prepare inputs with text prompt
         inputs = self.processor(
@@ -105,45 +115,31 @@ class CharacterSegmenter:
             return_tensors="pt"
         ).to(self.device)
         
+        print("Successfully prepared imputs")
+
         with torch.no_grad():
             outputs = self.model(**inputs)
         
-        # Get masks
-        masks = outputs.pred_masks.squeeze().cpu().numpy()
-        scores = outputs.iou_scores.squeeze().cpu().numpy()
+        # Use the correct post-processing method for SAM3
+        results = self.processor.post_process_instance_segmentation(
+            outputs,
+            threshold=threshold,
+            mask_threshold=0.5,
+            target_sizes=inputs.get("original_sizes").tolist()
+        )[0]
         
-        return masks, scores
-    
-    def segment_with_points(self, image, points):
-        """
-        Segment using point prompts
-        
-        Args:
-            image: PIL Image
-            points: List of [x, y] coordinates
-            
-        Returns:
-            List of masks and scores
-        """
-        # Prepare inputs with point prompts
-        inputs = self.processor(
-            images=image,
-            input_points=[[points]],  # Batch of point sets
-            return_tensors="pt"
-        ).to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        
-        # Get masks
-        masks = outputs.pred_masks.squeeze().cpu().numpy()
-        scores = outputs.iou_scores.squeeze().cpu().numpy()
-        
-        return masks, scores
-    
+        print("Segmentation result obtained")
+
+        # Move tensors to CPU and convert to numpy for easier downstream processing
+        return {
+            "masks": results["masks"].cpu().numpy(), # Shape: (N, H, W) bool
+            "boxes": results["boxes"].cpu().numpy(), # Shape: (N, 4) xyxy
+            "scores": results["scores"].cpu().numpy() # Shape: (N,)
+        }
+
     def segment_automatic(self, image):
         """
-        Automatic segmentation using multiple strategies
+        Automatic segmentation using text prompt strategy
         
         Args:
             image: PIL Image
@@ -154,92 +150,87 @@ class CharacterSegmenter:
         width, height = image.size
         all_masks = []
         
-        # Strategy 1: Text prompt for "character"
         print("  Running text-based segmentation...")
         try:
-            masks, scores = self.segment_with_text_prompt(image, "character")
+            # Get processed results directly
+            results = self.segment_with_text_prompt(image, "character", threshold=0.4)
             
-            # Process masks
-            if masks.ndim == 2:
-                masks = masks[np.newaxis, ...]
-                scores = np.array([scores]) if np.isscalar(scores) else scores
-            
-            for mask, score in zip(masks, scores):
-                if score > 0.5:  # Confidence threshold
-                    all_masks.append((mask, score))
+            masks = results["masks"]
+            boxes = results["boxes"]
+            scores = results["scores"]
+
+            # Pack into list for filtering
+            for i in range(len(scores)):
+                mask = masks[i]
+                bbox = boxes[i] # already in [x_min, y_min, x_max, y_max] format usually
+                score = scores[i]
+                
+                # Convert bbox to [x, y, w, h] for consistency with rest of pipeline if needed,
+                # BUT the standard output is usually [x1, y1, x2, y2]. 
+                # Let's standardize to [x, y, w, h] for the filter function or adapt filter function.
+                # Actually, let's keep it as is and just construct the tuple.
+                # The 'filter_masks' function expects (mask, score).
+                
+                all_masks.append((mask, score, bbox))
+                
         except Exception as e:
             print(f"  Warning: Text-based segmentation failed: {e}")
-        
-        # Strategy 2: Grid-based point prompts
-        print("  Running point-based segmentation...")
-        try:
-            grid_points = self.generate_point_grid(width, height, grid_size=6)
-            
-            for point in grid_points:
-                masks, scores = self.segment_with_points(image, [point])
-                
-                if masks.ndim == 2:
-                    masks = masks[np.newaxis, ...]
-                    scores = np.array([scores]) if np.isscalar(scores) else scores
-                
-                for mask, score in zip(masks, scores):
-                    if score > 0.6:
-                        all_masks.append((mask, score))
-        except Exception as e:
-            print(f"  Warning: Point-based segmentation failed: {e}")
-        
+            import traceback
+            traceback.print_exc()
+
         # Remove duplicate/overlapping masks
-        filtered_masks = self.filter_masks(all_masks, width * height)
+        # Note: filter_masks currently expects (mask, score), we need to adapt it 
+        # or pass data differently. 
+        filtered_results = self.filter_masks_with_boxes(all_masks, width * height)
         
-        # Convert to (mask, bbox, score) format
-        results = []
-        for mask, score in filtered_masks:
-            bbox = self.mask_to_bbox(mask)
-            if bbox is not None:
-                results.append((mask, bbox, score))
-        
-        return results
+        return filtered_results
     
-    def filter_masks(self, masks_with_scores, image_area, iou_threshold=0.7):
+    def filter_masks_with_boxes(self, masks_data, image_area, iou_threshold=0.7):
         """
-        Filter overlapping and invalid masks
+        Filter overlapping and invalid masks, preserving pre-calculated boxes
         
         Args:
-            masks_with_scores: List of (mask, score) tuples
+            masks_data: List of (mask, score, bbox) tuples
             image_area: Total image area
-            iou_threshold: IoU threshold for considering masks as duplicates
             
         Returns:
-            Filtered list of (mask, score) tuples
+            Filtered list of (mask, bbox, score) tuples
         """
-        if not masks_with_scores:
+        if not masks_data:
             return []
         
         # Sort by score
-        masks_with_scores.sort(key=lambda x: x[1], reverse=True)
+        masks_data.sort(key=lambda x: x[1], reverse=True)
         
         # Filter by area
-        min_area = image_area * 0.005  # Minimum 0.5%
-        max_area = image_area * 0.85   # Maximum 85%
+        min_area = image_area * 0.005
+        max_area = image_area * 0.85
         
-        valid_masks = []
-        for mask, score in masks_with_scores:
+        valid_items = []
+        for mask, score, bbox in masks_data:
             area = mask.sum()
             if min_area < area < max_area:
-                valid_masks.append((mask, score))
+                valid_items.append((mask, score, bbox))
         
-        # Remove overlapping masks (non-maximum suppression)
+        # Remove overlapping (NMS)
         filtered = []
-        for i, (mask1, score1) in enumerate(valid_masks):
+        for i, (mask1, score1, bbox1) in enumerate(valid_items):
             keep = True
-            for mask2, score2 in filtered:
+            for mask2, _, _ in filtered:
                 iou = self.calculate_iou(mask1, mask2)
                 if iou > iou_threshold:
                     keep = False
                     break
             if keep:
-                filtered.append((mask1, score1))
-                if len(filtered) >= 15:  # Max 15 characters
+                # Convert xyxy (if that's what SAM3 returns) to xywh for the cropping logic
+                # SAM3 post_process returns [x1, y1, x2, y2]
+                x1, y1, x2, y2 = bbox1
+                w = x2 - x1
+                h = y2 - y1
+                final_bbox = [int(x1), int(y1), int(w), int(h)]
+                
+                filtered.append((mask1, final_bbox, score1))
+                if len(filtered) >= 15:
                     break
         
         return filtered
@@ -249,27 +240,6 @@ class CharacterSegmenter:
         intersection = np.logical_and(mask1, mask2).sum()
         union = np.logical_or(mask1, mask2).sum()
         return intersection / union if union > 0 else 0
-    
-    def mask_to_bbox(self, mask):
-        """
-        Convert mask to bounding box
-        
-        Args:
-            mask: Binary mask array
-            
-        Returns:
-            [x, y, width, height] or None if invalid
-        """
-        rows = np.any(mask, axis=1)
-        cols = np.any(mask, axis=0)
-        
-        if not rows.any() or not cols.any():
-            return None
-        
-        y_min, y_max = np.where(rows)[0][[0, -1]]
-        x_min, x_max = np.where(cols)[0][[0, -1]]
-        
-        return [int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min)]
     
     def segment_image(self, image_path, force=False):
         """
@@ -289,7 +259,6 @@ class CharacterSegmenter:
         if not force and image_id in self.metadata:
             print(f"⊙ Image {image_id} already segmented")
             existing_crops = self.metadata[image_id].get('character_crops', [])
-            # Verify files still exist
             if all(Path(crop).exists() for crop in existing_crops):
                 return existing_crops
         
@@ -312,7 +281,7 @@ class CharacterSegmenter:
             # Crop each character
             character_images = []
             for idx, (mask, bbox, score) in enumerate(masks_data):
-                # Extract bounding box
+                # Extract bounding box [x, y, w, h]
                 x, y, box_w, box_h = bbox
                 x_min, y_min = x, y
                 x_max, y_max = x + box_w, y + box_h
@@ -352,16 +321,7 @@ class CharacterSegmenter:
             return []
     
     def segment_batch(self, image_paths, force=False):
-        """
-        Segment characters from multiple images
-        
-        Args:
-            image_paths: List of image file paths
-            force: Force re-segmentation
-            
-        Returns:
-            Dictionary mapping image_id to list of character crop paths
-        """
+        """Segment characters from multiple images"""
         print(f"\n{'='*60}")
         print(f"Segmenting {len(image_paths)} images")
         print(f"{'='*60}")
@@ -381,23 +341,14 @@ class CharacterSegmenter:
         print(f"{'='*60}")
         print(f"Processed images: {len(image_paths)}")
         print(f"Total characters extracted: {total_characters}")
-        print(f"Average characters per image: {total_characters/len(image_paths):.1f}")
+        if len(image_paths) > 0:
+            print(f"Average characters per image: {total_characters/len(image_paths):.1f}")
         print(f"Output directory: {self.output_dir}")
-        print(f"Metadata file: {self.metadata_file}")
         
         return results
     
     def segment_directory(self, image_dir, force=False):
-        """
-        Segment all images in a directory
-        
-        Args:
-            image_dir: Directory containing images
-            force: Force re-segmentation
-            
-        Returns:
-            Dictionary of results
-        """
+        """Segment all images in a directory"""
         image_dir = Path(image_dir)
         image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
         
@@ -411,23 +362,3 @@ class CharacterSegmenter:
             return {}
         
         return self.segment_batch(image_paths, force=force)
-
-# # Example usage
-# if __name__ == "__main__":
-#     # Initialize segmenter with SAM3
-#     segmenter = CharacterSegmenter(
-#         output_dir="character_crops",
-#         model_name="facebook/sam3"
-#     )
-    
-#     # Segment all images from download directory
-#     results = segmenter.segment_directory("meme_downloads")
-    
-#     # Or segment specific images
-#     # results = segmenter.segment_batch([
-#     #     "meme_downloads/meme_0.jpg",
-#     #     "meme_downloads/meme_1.jpg"
-#     # ])
-    
-#     # Or segment single image
-#     # crops = segmenter.segment_image("meme_downloads/meme_0.jpg")

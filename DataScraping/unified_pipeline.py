@@ -1,6 +1,6 @@
 """
-unified_pipeline.py - Complete pipeline with single UI: download → segment → sort
-Characters are sorted immediately after segmentation without intermediate storage
+unified_pipeline.py - Modified: Save all crops to discard, then sort from there
+Pipeline: download → segment to discard → load from discard → sort (move or keep)
 """
 import os
 import json
@@ -27,6 +27,7 @@ class UnifiedPipeline:
         self.delay_var = None
         self.download_dir_var = None
         self.sorted_dir_var = None
+        self.hf_token_var = None
         
         # Pipeline components
         self.scraper = None
@@ -47,10 +48,9 @@ class UnifiedPipeline:
         # Current state
         self.is_running = False
         self.current_meme_id = None
-        self.character_queue = queue.Queue()
-        self.current_character = None
-        self.characters_buffer = []  # Buffer of characters from current meme
-        self.character_index = 0
+        self.images_to_sort = []  # List of image paths from discard folder
+        self.current_index = 0
+        self.current_image_path = None
         
         # Statistics
         self.stats = {
@@ -60,7 +60,8 @@ class UnifiedPipeline:
             'Bo': 0,
             'Gau': 0,
             'Others': 0,
-            'Discarded': 0
+            'Discarded': 0,
+            'total_characters': 0
         }
         
         # History for undo
@@ -210,6 +211,33 @@ class UnifiedPipeline:
             font=input_font
         ).grid(row=3, column=1, padx=10, pady=5, sticky=tk.W, columnspan=2)
         
+        # Row 4: HF Token
+        tk.Label(
+            self.config_frame,
+            text="HF Token:",
+            font=input_font,
+            bg='#2b2b2b',
+            fg='#cccccc'
+        ).grid(row=4, column=0, padx=10, pady=5, sticky=tk.W)
+        
+        self.hf_token_var = tk.StringVar(value="")
+        hf_entry = tk.Entry(
+            self.config_frame,
+            textvariable=self.hf_token_var,
+            width=30,
+            font=input_font,
+            show="*"
+        )
+        hf_entry.grid(row=4, column=1, padx=10, pady=5, sticky=tk.W, columnspan=2)
+        
+        tk.Label(
+            self.config_frame,
+            text="(from https://huggingface.co/settings/tokens)",
+            font=("Arial", 8),
+            bg='#2b2b2b',
+            fg='#888888'
+        ).grid(row=5, column=1, padx=10, pady=2, sticky=tk.W, columnspan=2)
+        
         # Start button
         self.start_button = tk.Button(
             self.config_frame,
@@ -224,7 +252,7 @@ class UnifiedPipeline:
             pady=10,
             cursor="hand2"
         )
-        self.start_button.grid(row=0, column=4, rowspan=4, padx=20, pady=5)
+        self.start_button.grid(row=0, column=4, rowspan=6, padx=20, pady=5)
     
     def create_progress_frame(self):
         """Create progress tracking frame"""
@@ -318,8 +346,10 @@ class UnifiedPipeline:
     
     def update_stats_display(self):
         """Update statistics display"""
+        remaining = len(self.images_to_sort) - self.current_index
         stats_text = (
             f"Memes: {self.stats['memes_processed']} processed | "
+            f"Remaining: {remaining} | "
             f"Bo: {self.stats['Bo']} | Gau: {self.stats['Gau']} | "
             f"Others: {self.stats['Others']} | Discarded: {self.stats['Discarded']}"
         )
@@ -333,7 +363,7 @@ class UnifiedPipeline:
         self.bo_folder = self.sorted_dir / "Bo"
         self.gau_folder = self.sorted_dir / "Gau"
         self.others_folder = self.sorted_dir / "Others"
-        self.discarded_folder = self.sorted_dir / ".discarded"
+        self.discarded_folder = self.sorted_dir / "Discarded"
         
         for folder in [self.bo_folder, self.gau_folder, self.others_folder, self.discarded_folder]:
             folder.mkdir(parents=True, exist_ok=True)
@@ -344,7 +374,7 @@ class UnifiedPipeline:
     
     def load_metadata(self):
         """Load existing metadata"""
-        if self.metadata_file.exists():
+        if self.metadata_file and self.metadata_file.exists():
             with open(self.metadata_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 self.metadata = data
@@ -385,9 +415,6 @@ class UnifiedPipeline:
         # Run pipeline in background thread
         thread = Thread(target=self.run_pipeline, daemon=True)
         thread.start()
-        
-        # Start checking for characters
-        self.root.after(100, self.check_for_characters)
     
     def run_pipeline(self):
         """Run the download and segmentation pipeline"""
@@ -396,143 +423,161 @@ class UnifiedPipeline:
             count = int(self.count_var.get())
             delay = float(self.delay_var.get())
             
-            # Initialize components
-            self.update_progress("Initializing scraper...")
+            # Phase 1: Download all memes in batch
+            self.update_progress("Downloading memes in batch...")
             self.scraper = MemeScraper(download_dir=str(self.download_dir))
             
-            self.update_progress("Loading SAM3 model...")
-            self.segmenter = CharacterSegmenter(output_dir="temp_crops")
+            downloaded_results = self.scraper.download_batch(
+                start_id=start_id,
+                count=count,
+                delay=delay,
+                force=False
+            )
             
-            # Process each meme
-            for meme_id in range(start_id, start_id + count):
+            # Update stats from download
+            downloaded_memes = [int(mid) for mid in downloaded_results.keys()]
+            self.stats['memes_downloaded'] = len(downloaded_memes)
+            self.stats['memes_skipped'] = len(self.scraper.get_skipped_memes())
+            
+            # Cleanup scraper
+            if self.scraper:
+                self.scraper.cleanup()
+            
+            if not downloaded_memes:
+                self.update_progress("No memes downloaded. Nothing to segment.")
+                self.show_completion()
+                return
+            
+            # Phase 2: Load SAM3 and segment all downloaded memes
+            self.update_progress("Loading SAM3 model...")
+            hf_token = self.hf_token_var.get().strip() or None
+            self.segmenter = CharacterSegmenter(
+                output_dir=str(self.discarded_folder), 
+                hf_token=hf_token
+            )
+            
+            # Segment all downloaded memes
+            total_characters = 0
+            for meme_id in downloaded_memes:
                 if not self.is_running:
                     break
                 
                 self.current_meme_id = meme_id
-                self.update_progress(f"Downloading meme {meme_id}...")
+                meme_path = downloaded_results[meme_id]
                 
-                # Download
-                result = self.scraper.download_meme(meme_id, force=False)
-                
-                if result == 'skipped':
-                    self.stats['memes_skipped'] += 1
-                    continue
-                elif result is None:
-                    continue
-                
-                self.stats['memes_downloaded'] += 1
-                
-                # Segment
-                self.update_progress(f"Segmenting characters from meme {meme_id}...")
-                image = Image.open(result).convert("RGB")
+                self.update_progress(f"Segmenting meme {meme_id}...")
                 
                 try:
-                    masks_data = self.segmenter.segment_automatic(image)
+                    character_paths = self.segmenter.segment_image(meme_path, force=False)
                     
-                    if not masks_data:
+                    if character_paths:
+                        total_characters += len(character_paths)
+                        self.update_progress(
+                            f"Saved {len(character_paths)} characters from meme {meme_id}"
+                        )
+                    else:
                         self.update_progress(f"No characters found in meme {meme_id}")
-                        self.stats['memes_processed'] += 1
-                        continue
                     
-                    # Add characters to queue for sorting
-                    width, height = image.size
-                    for idx, (mask, bbox, score) in enumerate(masks_data):
-                        x, y, box_w, box_h = bbox
-                        
-                        # Add padding
-                        padding = 10
-                        x_min = max(0, x - padding)
-                        y_min = max(0, y - padding)
-                        x_max = min(width, x + box_w + padding)
-                        y_max = min(height, y + box_h + padding)
-                        
-                        # Crop
-                        cropped = image.crop((x_min, y_min, x_max, y_max))
-                        
-                        # Add to queue
-                        self.character_queue.put({
-                            'image': cropped,
-                            'meme_id': meme_id,
-                            'char_idx': idx,
-                            'score': score
-                        })
-                    
-                    self.update_progress(f"Found {len(masks_data)} characters in meme {meme_id}. Sorting...")
                     self.stats['memes_processed'] += 1
                     
                 except Exception as e:
                     self.update_progress(f"Error segmenting meme {meme_id}: {e}")
-                
-                # Delay before next
-                if meme_id < start_id + count - 1:
-                    import time
-                    time.sleep(delay)
+                    import traceback
+                    traceback.print_exc()
             
-            # Cleanup
+            # Cleanup scraper
             if self.scraper:
                 self.scraper.cleanup()
             
-            # Signal completion
-            self.character_queue.put(None)
+            # Now load all images from discard folder for sorting
+            self.update_progress("Loading characters for sorting...")
+            self.load_images_from_discard()
+            
+            self.stats['total_characters'] = total_characters
+            
+            # Start sorting phase
+            if self.images_to_sort:
+                self.update_progress(f"Ready to sort {len(self.images_to_sort)} characters")
+                self.root.after(100, self.show_next_character)
+            else:
+                self.update_progress("No characters to sort")
+                self.show_completion()
             
         except Exception as e:
             messagebox.showerror("Pipeline Error", f"An error occurred: {e}")
+            import traceback
+            traceback.print_exc()
             self.stop_pipeline()
     
-    def check_for_characters(self):
-        """Check queue for new characters to sort"""
+    def load_images_from_discard(self):
+        """Load all images from discard folder for sorting"""
+        self.images_to_sort = []
+        
+        # Get all PNG files from discard folder
+        for img_path in sorted(self.discarded_folder.glob("*.png")):
+            # Skip if already sorted (check metadata)
+            if 'sorted_images' in self.metadata:
+                # Check if this file was moved (it shouldn't exist in discard if moved)
+                # But we'll check metadata to see if it was already processed
+                already_sorted = False
+                for sorted_path, info in self.metadata['sorted_images'].items():
+                    sorted_path_obj = Path(sorted_path)
+                    if sorted_path_obj.name == img_path.name:
+                        # Check if it was moved to another folder
+                        if sorted_path_obj.parent != self.discarded_folder:
+                            already_sorted = True
+                            break
+                
+                if already_sorted:
+                    continue
+            
+            self.images_to_sort.append(img_path)
+        
+        self.current_index = 0
+        print(f"Loaded {len(self.images_to_sort)} images for sorting")
+    
+    def show_next_character(self):
+        """Show next character from the list"""
         if not self.is_running:
             return
         
-        try:
-            # Check if there's a character in queue
-            if not self.character_queue.empty():
-                character = self.character_queue.get_nowait()
-                
-                if character is None:
-                    # Pipeline complete
-                    self.show_completion()
-                    return
-                
-                self.current_character = character
-                self.show_character()
-        except queue.Empty:
-            pass
-        
-        # Check again in 100ms
-        self.root.after(100, self.check_for_characters)
-    
-    def show_character(self):
-        """Display current character for sorting"""
-        if not self.current_character:
+        if self.current_index >= len(self.images_to_sort):
+            # All sorted
+            self.show_completion()
             return
         
-        char = self.current_character
+        self.current_image_path = self.images_to_sort[self.current_index]
         
         # Update info
+        img_name = self.current_image_path.name
         self.info_label.config(
-            text=f"Meme {char['meme_id']} - Character {char['char_idx'] + 1} | Score: {char['score']:.3f}"
+            text=f"Character {self.current_index + 1}/{len(self.images_to_sort)} - {img_name}"
         )
         
         # Display image
-        img = char['image']
-        
-        # Resize to fit
-        max_size = (700, 500)
-        img.thumbnail(max_size, Image.Resampling.LANCZOS)
-        
-        photo = ImageTk.PhotoImage(img)
-        self.image_label.config(image=photo)
-        self.image_label.image = photo
+        try:
+            img = Image.open(self.current_image_path)
+            
+            # Resize to fit
+            max_size = (700, 500)
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            
+            photo = ImageTk.PhotoImage(img)
+            self.image_label.config(image=photo)
+            self.image_label.image = photo
+        except Exception as e:
+            print(f"Error loading image {self.current_image_path}: {e}")
+            # Skip to next
+            self.current_index += 1
+            self.root.after(100, self.show_next_character)
+            return
         
         self.update_stats_display()
     
     def sort_character(self, category):
         """Sort current character into category"""
-        if not self.current_character:
+        if not self.current_image_path or not self.current_image_path.exists():
             return
-        
-        char = self.current_character
         
         # Determine destination
         folder_map = {
@@ -543,47 +588,70 @@ class UnifiedPipeline:
         }
         destination = folder_map[category]
         
-        # Save image
-        filename = f"meme_{char['meme_id']}_char_{char['char_idx']:02d}.png"
-        dest_path = destination / filename
+        # If discarded, just leave it there
+        if category == 'Discarded':
+            # Just update metadata and move to next
+            if 'sorted_images' not in self.metadata:
+                self.metadata['sorted_images'] = {}
+            
+            self.metadata['sorted_images'][str(self.current_image_path)] = {
+                'category': 'Discarded',
+                'original_path': str(self.current_image_path)
+            }
+            self.save_metadata()
+            
+            self.stats['Discarded'] += 1
+            
+            # Add to history
+            self.history.append({
+                'source': self.current_image_path,
+                'destination': self.current_image_path,  # Same location
+                'category': category,
+                'action': 'keep'
+            })
+        else:
+            # Move to destination folder
+            dest_path = destination / self.current_image_path.name
+            
+            # Handle duplicates
+            if dest_path.exists():
+                counter = 1
+                stem = dest_path.stem
+                suffix = dest_path.suffix
+                while dest_path.exists():
+                    dest_path = destination / f"{stem}_{counter}{suffix}"
+                    counter += 1
+            
+            # Move file
+            shutil.move(str(self.current_image_path), str(dest_path))
+            
+            # Update metadata
+            if 'sorted_images' not in self.metadata:
+                self.metadata['sorted_images'] = {}
+            
+            self.metadata['sorted_images'][str(dest_path)] = {
+                'category': category,
+                'original_path': str(self.current_image_path)
+            }
+            self.save_metadata()
+            
+            # Update stats
+            self.stats[category] += 1
+            
+            # Add to history
+            self.history.append({
+                'source': self.current_image_path,
+                'destination': dest_path,
+                'category': category,
+                'action': 'move'
+            })
         
-        # Handle duplicates
-        if dest_path.exists():
-            counter = 1
-            stem = dest_path.stem
-            while dest_path.exists():
-                dest_path = destination / f"{stem}_{counter}.png"
-                counter += 1
-        
-        char['image'].save(dest_path)
-        
-        # Update metadata
-        if 'sorted_images' not in self.metadata:
-            self.metadata['sorted_images'] = {}
-        
-        self.metadata['sorted_images'][str(dest_path)] = {
-            'meme_id': char['meme_id'],
-            'char_idx': char['char_idx'],
-            'category': category,
-            'score': char['score']
-        }
-        self.save_metadata()
-        
-        # Update stats
-        self.stats[category] += 1
-        
-        # Add to history
-        self.history.append({
-            'character': char,
-            'destination': dest_path,
-            'category': category
-        })
-        
-        # Clear current and wait for next
-        self.current_character = None
-        self.info_label.config(text="Waiting for next character...")
-        self.image_label.config(image='')
+        # Move to next character
+        self.current_index += 1
         self.update_stats_display()
+        
+        # Show next
+        self.root.after(100, self.show_next_character)
     
     def undo_action(self):
         """Undo last sorting action"""
@@ -592,26 +660,36 @@ class UnifiedPipeline:
             return
         
         last = self.history.pop()
-        dest_path = last['destination']
+        source = last['source']
+        destination = last['destination']
         category = last['category']
+        action = last['action']
         
-        # Delete file
-        if dest_path.exists():
-            dest_path.unlink()
-        
-        # Update metadata
-        if str(dest_path) in self.metadata.get('sorted_images', {}):
-            del self.metadata['sorted_images'][str(dest_path)]
-            self.save_metadata()
+        if action == 'move':
+            # Move back from destination to discard
+            if destination.exists():
+                shutil.move(str(destination), str(source))
+            
+            # Update metadata
+            if str(destination) in self.metadata.get('sorted_images', {}):
+                del self.metadata['sorted_images'][str(destination)]
+                self.save_metadata()
+        else:  # action == 'keep' (for Discarded)
+            # Remove from metadata
+            if str(source) in self.metadata.get('sorted_images', {}):
+                del self.metadata['sorted_images'][str(source)]
+                self.save_metadata()
         
         # Update stats
         self.stats[category] -= 1
         
-        # Put character back in front
-        self.current_character = last['character']
-        self.show_character()
+        # Go back one step
+        self.current_index = max(0, self.current_index - 1)
         
-        messagebox.showinfo("Undo", "Last action undone!")
+        # Show previous character
+        self.show_next_character()
+        
+        self.update_stats_display()
     
     def show_completion(self):
         """Show completion message"""
@@ -627,18 +705,27 @@ class UnifiedPipeline:
         self.info_label.config(text="All characters sorted!")
         self.update_progress("Pipeline complete!")
         
+        # Count remaining in discard folder (not in metadata as sorted)
+        remaining_in_discard = 0
+        for img_path in self.discarded_folder.glob("*.png"):
+            if str(img_path) not in self.metadata.get('sorted_images', {}):
+                remaining_in_discard += 1
+        
         # Show summary
+        total_sorted = sum([self.stats[k] for k in ['Bo', 'Gau', 'Others', 'Discarded']])
         summary = (
             f"Pipeline Complete!\n\n"
             f"Memes processed: {self.stats['memes_processed']}\n"
             f"Memes downloaded: {self.stats['memes_downloaded']}\n"
-            f"Memes skipped: {self.stats['memes_skipped']}\n\n"
+            f"Memes skipped: {self.stats['memes_skipped']}\n"
+            f"Total characters extracted: {self.stats.get('total_characters', 0)}\n\n"
             f"Characters sorted:\n"
             f"  Bo: {self.stats['Bo']}\n"
             f"  Gau: {self.stats['Gau']}\n"
             f"  Others: {self.stats['Others']}\n"
             f"  Discarded: {self.stats['Discarded']}\n\n"
-            f"Total: {sum([self.stats[k] for k in ['Bo', 'Gau', 'Others', 'Discarded']])}"
+            f"Total sorted: {total_sorted}\n"
+            f"Remaining unsorted: {remaining_in_discard}"
         )
         
         messagebox.showinfo("Complete", summary)
