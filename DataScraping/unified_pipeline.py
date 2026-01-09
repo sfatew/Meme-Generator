@@ -1,6 +1,6 @@
 """
-unified_pipeline.py - Modified: Save all crops to discard, then sort from there
-Pipeline: download → segment to discard → load from discard → sort (move or keep)
+unified_pipeline_v2.py - With auto-captioning and tag management
+Pipeline: download → segment to discard → sort → caption → manage tags
 """
 import os
 import json
@@ -8,12 +8,13 @@ import shutil
 from pathlib import Path
 from PIL import Image, ImageTk
 import tkinter as tk
-from tkinter import ttk, messagebox, font as tkfont
+from tkinter import ttk, messagebox, font as tkfont, scrolledtext
 from threading import Thread
-import queue
+from collections import Counter
 
 from scraper import MemeScraper
 from character_segment import CharacterSegmenter
+from image_captioner import ImageCaptioner
 
 
 class UnifiedPipeline:
@@ -32,6 +33,7 @@ class UnifiedPipeline:
         # Pipeline components
         self.scraper = None
         self.segmenter = None
+        self.captioner = None
         
         # Output directories
         self.download_dir = None
@@ -48,9 +50,14 @@ class UnifiedPipeline:
         # Current state
         self.is_running = False
         self.current_meme_id = None
-        self.images_to_sort = []  # List of image paths from discard folder
+        self.images_to_sort = []
         self.current_index = 0
         self.current_image_path = None
+        
+        # Captioning state
+        self.caption_results = {}
+        self.tag_stats = Counter()
+        self.selected_image_for_tags = None
         
         # Statistics
         self.stats = {
@@ -68,9 +75,11 @@ class UnifiedPipeline:
         self.history = []
         
         # UI components
+        self.notebook = None
         self.config_frame = None
         self.progress_frame = None
         self.sorting_frame = None
+        self.caption_frame = None
         self.image_label = None
         self.info_label = None
         self.stats_label = None
@@ -78,10 +87,10 @@ class UnifiedPipeline:
         self.start_button = None
     
     def create_ui(self):
-        """Create the unified UI"""
+        """Create the unified UI with tabs"""
         self.root = tk.Tk()
         self.root.title("Meme Character Pipeline")
-        self.root.geometry("1100x900")
+        self.root.geometry("1200x950")
         self.root.configure(bg='#2b2b2b')
         
         # Title
@@ -95,14 +104,25 @@ class UnifiedPipeline:
         )
         title.pack(pady=15)
         
-        # Configuration Frame
-        self.create_config_frame()
+        # Create notebook for tabs
+        style = ttk.Style()
+        style.theme_use('default')
+        style.configure('TNotebook', background='#2b2b2b')
+        style.configure('TNotebook.Tab', background='#3c3c3c', foreground='#ffffff', padding=[20, 10])
+        style.map('TNotebook.Tab', background=[('selected', '#4CAF50')])
         
-        # Progress Frame
-        self.create_progress_frame()
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(expand=True, fill='both', padx=20, pady=10)
         
-        # Sorting Frame
-        self.create_sorting_frame()
+        # Tab 1: Pipeline (Download & Sort)
+        pipeline_tab = tk.Frame(self.notebook, bg='#2b2b2b')
+        self.notebook.add(pipeline_tab, text='📥 Pipeline')
+        self.create_pipeline_tab(pipeline_tab)
+        
+        # Tab 2: Captioning
+        caption_tab = tk.Frame(self.notebook, bg='#2b2b2b')
+        self.notebook.add(caption_tab, text='🏷️ Auto-Caption')
+        self.create_caption_tab(caption_tab)
         
         # Bind keyboard events
         self.root.bind('<Left>', lambda e: self.sort_character('Bo') if self.is_running else None)
@@ -112,10 +132,192 @@ class UnifiedPipeline:
         self.root.bind('<BackSpace>', lambda e: self.undo_action() if self.is_running else None)
         self.root.bind('<Escape>', lambda e: self.stop_pipeline())
     
-    def create_config_frame(self):
+    def create_pipeline_tab(self, parent):
+        """Create the pipeline tab (original functionality)"""
+        # Configuration Frame
+        self.create_config_frame(parent)
+        
+        # Progress Frame
+        self.create_progress_frame(parent)
+        
+        # Sorting Frame
+        self.create_sorting_frame(parent)
+    
+    def create_caption_tab(self, parent):
+        """Create the captioning and tag management tab"""
+        # Top frame: Controls
+        control_frame = tk.Frame(parent, bg='#2b2b2b')
+        control_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        # Caption button
+        self.caption_button = tk.Button(
+            control_frame,
+            text="🏷️ Generate Captions (Bo + Gau)",
+            command=self.start_captioning,
+            font=("Arial", 12, "bold"),
+            bg='#2196F3',
+            fg='white',
+            relief=tk.RAISED,
+            borderwidth=3,
+            padx=20,
+            pady=10,
+            cursor="hand2"
+        )
+        self.caption_button.pack(side=tk.LEFT, padx=5)
+        
+        # Refresh stats button
+        refresh_btn = tk.Button(
+            control_frame,
+            text="🔄 Refresh Stats",
+            command=self.refresh_tag_stats,
+            font=("Arial", 11),
+            bg='#FF9800',
+            fg='white',
+            relief=tk.RAISED,
+            borderwidth=2,
+            padx=15,
+            pady=8,
+            cursor="hand2"
+        )
+        refresh_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Main content: Split view
+        content_frame = tk.Frame(parent, bg='#2b2b2b')
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        # Left: Tag statistics
+        left_frame = tk.LabelFrame(
+            content_frame,
+            text="Tag Statistics",
+            font=("Arial", 12, "bold"),
+            bg='#2b2b2b',
+            fg='#ffffff',
+            relief=tk.RIDGE,
+            borderwidth=2
+        )
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        
+        # Search/filter
+        search_frame = tk.Frame(left_frame, bg='#2b2b2b')
+        search_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(search_frame, text="Filter:", bg='#2b2b2b', fg='#cccccc').pack(side=tk.LEFT)
+        self.tag_filter_var = tk.StringVar()
+        self.tag_filter_var.trace('w', lambda *args: self.filter_tags())
+        filter_entry = tk.Entry(search_frame, textvariable=self.tag_filter_var, width=20)
+        filter_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Tag list with scrollbar
+        list_frame = tk.Frame(left_frame, bg='#2b2b2b')
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.tag_listbox = tk.Listbox(
+            list_frame,
+            font=("Courier", 10),
+            bg='#1a1a1a',
+            fg='#ffffff',
+            selectmode=tk.SINGLE,
+            yscrollcommand=scrollbar.set,
+            height=20
+        )
+        self.tag_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.tag_listbox.yview)
+        
+        self.tag_listbox.bind('<<ListboxSelect>>', self.on_tag_select)
+        
+        # Remove tag button
+        remove_btn = tk.Button(
+            left_frame,
+            text="❌ Remove Selected Tag from All Images",
+            command=self.remove_selected_tag,
+            font=("Arial", 10, "bold"),
+            bg='#f44336',
+            fg='white',
+            relief=tk.RAISED,
+            borderwidth=2,
+            padx=10,
+            pady=5,
+            cursor="hand2"
+        )
+        remove_btn.pack(pady=10)
+        
+        # Right: Image browser
+        right_frame = tk.LabelFrame(
+            content_frame,
+            text="Image Tags Viewer",
+            font=("Arial", 12, "bold"),
+            bg='#2b2b2b',
+            fg='#ffffff',
+            relief=tk.RIDGE,
+            borderwidth=2
+        )
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        # Directory selector
+        dir_frame = tk.Frame(right_frame, bg='#2b2b2b')
+        dir_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(dir_frame, text="View:", bg='#2b2b2b', fg='#cccccc').pack(side=tk.LEFT)
+        
+        self.view_dir_var = tk.StringVar(value="Bo")
+        for dirname in ["Bo", "Gau"]:
+            tk.Radiobutton(
+                dir_frame,
+                text=dirname,
+                variable=self.view_dir_var,
+                value=dirname,
+                bg='#2b2b2b',
+                fg='#ffffff',
+                selectcolor='#3c3c3c',
+                command=self.load_images_for_viewer
+            ).pack(side=tk.LEFT, padx=5)
+        
+        # Image list
+        image_list_frame = tk.Frame(right_frame, bg='#2b2b2b')
+        image_list_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(image_list_frame, text="Images:", bg='#2b2b2b', fg='#cccccc').pack(side=tk.LEFT)
+        
+        self.image_combo = ttk.Combobox(image_list_frame, state='readonly', width=30)
+        self.image_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.image_combo.bind('<<ComboboxSelected>>', self.on_image_select)
+        
+        # Image preview
+        preview_frame = tk.Frame(right_frame, bg='#1a1a1a', relief=tk.SUNKEN, borderwidth=2)
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        self.preview_label = tk.Label(preview_frame, bg='#1a1a1a', fg='#888888', text="Select an image")
+        self.preview_label.pack(expand=True)
+        
+        # Tags display
+        tags_display_frame = tk.Frame(right_frame, bg='#2b2b2b')
+        tags_display_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        tk.Label(
+            tags_display_frame,
+            text="Tags:",
+            font=("Arial", 10, "bold"),
+            bg='#2b2b2b',
+            fg='#cccccc'
+        ).pack(anchor=tk.W)
+        
+        self.tags_text = scrolledtext.ScrolledText(
+            tags_display_frame,
+            font=("Arial", 10),
+            bg='#1a1a1a',
+            fg='#ffffff',
+            height=8,
+            wrap=tk.WORD
+        )
+        self.tags_text.pack(fill=tk.BOTH, expand=True)
+    
+    def create_config_frame(self, parent):
         """Create configuration input frame"""
         self.config_frame = tk.LabelFrame(
-            self.root,
+            parent,
             text="Configuration",
             font=("Arial", 12, "bold"),
             bg='#2b2b2b',
@@ -254,10 +456,10 @@ class UnifiedPipeline:
         )
         self.start_button.grid(row=0, column=4, rowspan=6, padx=20, pady=5)
     
-    def create_progress_frame(self):
+    def create_progress_frame(self, parent):
         """Create progress tracking frame"""
         self.progress_frame = tk.LabelFrame(
-            self.root,
+            parent,
             text="Progress",
             font=("Arial", 12, "bold"),
             bg='#2b2b2b',
@@ -277,10 +479,10 @@ class UnifiedPipeline:
         )
         self.progress_label.pack(pady=5, padx=10)
     
-    def create_sorting_frame(self):
+    def create_sorting_frame(self, parent):
         """Create character sorting frame"""
         self.sorting_frame = tk.LabelFrame(
-            self.root,
+            parent,
             text="Character Sorting",
             font=("Arial", 12, "bold"),
             bg='#2b2b2b',
@@ -423,7 +625,7 @@ class UnifiedPipeline:
             count = int(self.count_var.get())
             delay = float(self.delay_var.get())
             
-            # Phase 1: Download all memes in batch
+            # Phase 1: Download
             self.update_progress("Downloading memes in batch...")
             self.scraper = MemeScraper(download_dir=str(self.download_dir))
             
@@ -434,7 +636,7 @@ class UnifiedPipeline:
                 force=False
             )
             
-            # Update stats from download
+            # Update stats
             downloaded_memes = [int(mid) for mid in downloaded_results.keys()]
             self.stats['memes_downloaded'] = len(downloaded_memes)
             self.stats['memes_skipped'] = len(self.scraper.get_skipped_memes())
@@ -448,7 +650,7 @@ class UnifiedPipeline:
                 self.show_completion()
                 return
             
-            # Phase 2: Load SAM3 and segment all downloaded memes
+            # Phase 2: Segment
             self.update_progress("Loading SAM3 model...")
             hf_token = self.hf_token_var.get().strip() or None
             self.segmenter = CharacterSegmenter(
@@ -456,7 +658,6 @@ class UnifiedPipeline:
                 hf_token=hf_token
             )
             
-            # Segment all downloaded memes
             total_characters = 0
             for meme_id in downloaded_memes:
                 if not self.is_running:
@@ -485,17 +686,13 @@ class UnifiedPipeline:
                     import traceback
                     traceback.print_exc()
             
-            # Cleanup scraper
-            if self.scraper:
-                self.scraper.cleanup()
-            
-            # Now load all images from discard folder for sorting
+            # Phase 3: Load for sorting
             self.update_progress("Loading characters for sorting...")
             self.load_images_from_discard()
             
             self.stats['total_characters'] = total_characters
             
-            # Start sorting phase
+            # Start sorting
             if self.images_to_sort:
                 self.update_progress(f"Ready to sort {len(self.images_to_sort)} characters")
                 self.root.after(100, self.show_next_character)
@@ -513,17 +710,12 @@ class UnifiedPipeline:
         """Load all images from discard folder for sorting"""
         self.images_to_sort = []
         
-        # Get all PNG files from discard folder
         for img_path in sorted(self.discarded_folder.glob("*.png")):
-            # Skip if already sorted (check metadata)
             if 'sorted_images' in self.metadata:
-                # Check if this file was moved (it shouldn't exist in discard if moved)
-                # But we'll check metadata to see if it was already processed
                 already_sorted = False
                 for sorted_path, info in self.metadata['sorted_images'].items():
                     sorted_path_obj = Path(sorted_path)
                     if sorted_path_obj.name == img_path.name:
-                        # Check if it was moved to another folder
                         if sorted_path_obj.parent != self.discarded_folder:
                             already_sorted = True
                             break
@@ -537,12 +729,11 @@ class UnifiedPipeline:
         print(f"Loaded {len(self.images_to_sort)} images for sorting")
     
     def show_next_character(self):
-        """Show next character from the list"""
+        """Show next character"""
         if not self.is_running:
             return
         
         if self.current_index >= len(self.images_to_sort):
-            # All sorted
             self.show_completion()
             return
         
@@ -558,8 +749,7 @@ class UnifiedPipeline:
         try:
             img = Image.open(self.current_image_path)
             
-            # Resize to fit
-            max_size = (700, 500)
+            max_size = (700, 400)
             img.thumbnail(max_size, Image.Resampling.LANCZOS)
             
             photo = ImageTk.PhotoImage(img)
@@ -567,7 +757,6 @@ class UnifiedPipeline:
             self.image_label.image = photo
         except Exception as e:
             print(f"Error loading image {self.current_image_path}: {e}")
-            # Skip to next
             self.current_index += 1
             self.root.after(100, self.show_next_character)
             return
@@ -579,7 +768,6 @@ class UnifiedPipeline:
         if not self.current_image_path or not self.current_image_path.exists():
             return
         
-        # Determine destination
         folder_map = {
             'Bo': self.bo_folder,
             'Gau': self.gau_folder,
@@ -588,9 +776,7 @@ class UnifiedPipeline:
         }
         destination = folder_map[category]
         
-        # If discarded, just leave it there
         if category == 'Discarded':
-            # Just update metadata and move to next
             if 'sorted_images' not in self.metadata:
                 self.metadata['sorted_images'] = {}
             
@@ -602,18 +788,15 @@ class UnifiedPipeline:
             
             self.stats['Discarded'] += 1
             
-            # Add to history
             self.history.append({
                 'source': self.current_image_path,
-                'destination': self.current_image_path,  # Same location
+                'destination': self.current_image_path,
                 'category': category,
                 'action': 'keep'
             })
         else:
-            # Move to destination folder
             dest_path = destination / self.current_image_path.name
             
-            # Handle duplicates
             if dest_path.exists():
                 counter = 1
                 stem = dest_path.stem
@@ -622,10 +805,8 @@ class UnifiedPipeline:
                     dest_path = destination / f"{stem}_{counter}{suffix}"
                     counter += 1
             
-            # Move file
             shutil.move(str(self.current_image_path), str(dest_path))
             
-            # Update metadata
             if 'sorted_images' not in self.metadata:
                 self.metadata['sorted_images'] = {}
             
@@ -635,10 +816,8 @@ class UnifiedPipeline:
             }
             self.save_metadata()
             
-            # Update stats
             self.stats[category] += 1
             
-            # Add to history
             self.history.append({
                 'source': self.current_image_path,
                 'destination': dest_path,
@@ -646,11 +825,9 @@ class UnifiedPipeline:
                 'action': 'move'
             })
         
-        # Move to next character
         self.current_index += 1
         self.update_stats_display()
         
-        # Show next
         self.root.after(100, self.show_next_character)
     
     def undo_action(self):
@@ -666,27 +843,21 @@ class UnifiedPipeline:
         action = last['action']
         
         if action == 'move':
-            # Move back from destination to discard
             if destination.exists():
                 shutil.move(str(destination), str(source))
             
-            # Update metadata
             if str(destination) in self.metadata.get('sorted_images', {}):
                 del self.metadata['sorted_images'][str(destination)]
                 self.save_metadata()
-        else:  # action == 'keep' (for Discarded)
-            # Remove from metadata
+        else:
             if str(source) in self.metadata.get('sorted_images', {}):
                 del self.metadata['sorted_images'][str(source)]
                 self.save_metadata()
         
-        # Update stats
         self.stats[category] -= 1
         
-        # Go back one step
         self.current_index = max(0, self.current_index - 1)
         
-        # Show previous character
         self.show_next_character()
         
         self.update_stats_display()
@@ -705,13 +876,11 @@ class UnifiedPipeline:
         self.info_label.config(text="All characters sorted!")
         self.update_progress("Pipeline complete!")
         
-        # Count remaining in discard folder (not in metadata as sorted)
         remaining_in_discard = 0
         for img_path in self.discarded_folder.glob("*.png"):
             if str(img_path) not in self.metadata.get('sorted_images', {}):
                 remaining_in_discard += 1
         
-        # Show summary
         total_sorted = sum([self.stats[k] for k in ['Bo', 'Gau', 'Others', 'Discarded']])
         summary = (
             f"Pipeline Complete!\n\n"
@@ -736,6 +905,209 @@ class UnifiedPipeline:
             self.is_running = False
             self.start_button.config(state=tk.NORMAL, text="▶ START PIPELINE", bg='#4CAF50')
             self.update_progress("Pipeline stopped by user")
+    
+    # Captioning functions
+    def start_captioning(self):
+        """Start the captioning process in background"""
+        self.setup_directories()
+        
+        # Disable button
+        self.caption_button.config(state=tk.DISABLED, text="Generating...", bg='#757575')
+        
+        # Run in thread
+        thread = Thread(target=self.run_captioning, daemon=True)
+        thread.start()
+    
+    def run_captioning(self):
+        """Run the captioning on Bo and Gau folders"""
+        try:
+            # Initialize captioner
+            self.captioner = ImageCaptioner(threshold=0.35)
+            
+            # Caption Bo folder
+            bo_results = self.captioner.caption_batch(self.bo_folder, pattern="*.png")
+            
+            # Caption Gau folder
+            gau_results = self.captioner.caption_batch(self.gau_folder, pattern="*.png")
+            
+            # Combine results
+            self.caption_results = {**bo_results, **gau_results}
+            
+            # Update statistics
+            self.tag_stats = self.captioner.get_tag_statistics(self.caption_results)
+            
+            # Update UI
+            self.root.after(0, self.update_caption_ui)
+            
+            messagebox.showinfo(
+                "Captioning Complete",
+                f"Successfully captioned {len(self.caption_results)} images!\n"
+                f"Total unique tags: {len(self.tag_stats)}"
+            )
+            
+        except Exception as e:
+            messagebox.showerror("Captioning Error", f"An error occurred: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.caption_button.config(state=tk.NORMAL, text="🏷️ Generate Captions (Bo + Gau)", bg='#2196F3')
+    
+    def update_caption_ui(self):
+        """Update the caption tab UI with results"""
+        self.populate_tag_list()
+        self.load_images_for_viewer()
+    
+    def populate_tag_list(self, filter_text=""):
+        """Populate the tag listbox with statistics"""
+        self.tag_listbox.delete(0, tk.END)
+        
+        if not self.tag_stats:
+            self.tag_listbox.insert(tk.END, "No tags yet. Generate captions first.")
+            return
+        
+        # Filter and sort
+        filtered_tags = [
+            (tag, count) for tag, count in self.tag_stats.most_common()
+            if filter_text.lower() in tag.lower()
+        ]
+        
+        # Add to listbox
+        for tag, count in filtered_tags:
+            display = f"{tag:<40} ({count:>3})"
+            self.tag_listbox.insert(tk.END, display)
+    
+    def filter_tags(self):
+        """Filter tags based on search input"""
+        filter_text = self.tag_filter_var.get()
+        self.populate_tag_list(filter_text)
+    
+    def on_tag_select(self, event):
+        """Handle tag selection"""
+        selection = self.tag_listbox.curselection()
+        if not selection:
+            return
+        
+        # Get selected tag
+        item = self.tag_listbox.get(selection[0])
+        tag = item.split('(')[0].strip()
+        
+        # Show images with this tag
+        print(f"Selected tag: {tag}")
+    
+    def remove_selected_tag(self):
+        """Remove the selected tag from all images"""
+        selection = self.tag_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a tag to remove")
+            return
+        
+        # Get selected tag
+        item = self.tag_listbox.get(selection[0])
+        tag = item.split('(')[0].strip()
+        count = self.tag_stats[tag]
+        
+        # Confirm
+        if not messagebox.askyesno(
+            "Confirm Removal",
+            f"Remove tag '{tag}' from all {count} images?"
+        ):
+            return
+        
+        # Remove from Bo folder
+        modified_bo = self.captioner.remove_tag_from_all(tag, self.bo_folder)
+        
+        # Remove from Gau folder
+        modified_gau = self.captioner.remove_tag_from_all(tag, self.gau_folder)
+        
+        total_modified = modified_bo + modified_gau
+        
+        # Refresh stats
+        self.refresh_tag_stats()
+        
+        messagebox.showinfo(
+            "Tag Removed",
+            f"Removed tag '{tag}' from {total_modified} caption files"
+        )
+    
+    def refresh_tag_stats(self):
+        """Refresh tag statistics from caption files"""
+        if not self.captioner:
+            self.captioner = ImageCaptioner(threshold=0.35)
+        
+        self.caption_results = {}
+        
+        # Load from Bo
+        for txt_file in self.bo_folder.glob("*.txt"):
+            tags = self.captioner.load_caption_file(txt_file)
+            img_path = txt_file.with_suffix('.png')
+            if img_path.exists():
+                self.caption_results[str(img_path)] = tags
+        
+        # Load from Gau
+        for txt_file in self.gau_folder.glob("*.txt"):
+            tags = self.captioner.load_caption_file(txt_file)
+            img_path = txt_file.with_suffix('.png')
+            if img_path.exists():
+                self.caption_results[str(img_path)] = tags
+        
+        # Update stats
+        self.tag_stats = self.captioner.get_tag_statistics(self.caption_results)
+        
+        # Update UI
+        self.populate_tag_list()
+    
+    def load_images_for_viewer(self):
+        """Load images for the viewer combobox"""
+        dirname = self.view_dir_var.get()
+        folder = self.bo_folder if dirname == "Bo" else self.gau_folder
+        
+        # Get all PNG files
+        image_files = sorted([f.name for f in folder.glob("*.png")])
+        
+        self.image_combo['values'] = image_files
+        
+        if image_files:
+            self.image_combo.current(0)
+            self.on_image_select(None)
+    
+    def on_image_select(self, event):
+        """Handle image selection in viewer"""
+        if not self.image_combo.get():
+            return
+        
+        dirname = self.view_dir_var.get()
+        folder = self.bo_folder if dirname == "Bo" else self.gau_folder
+        
+        img_name = self.image_combo.get()
+        img_path = folder / img_name
+        
+        if not img_path.exists():
+            return
+        
+        # Load and display image
+        try:
+            img = Image.open(img_path)
+            
+            max_size = (300, 300)
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            
+            photo = ImageTk.PhotoImage(img)
+            self.preview_label.config(image=photo, text="")
+            self.preview_label.image = photo
+        except Exception as e:
+            print(f"Error loading preview: {e}")
+        
+        # Load and display tags
+        if not self.captioner:
+            self.captioner = ImageCaptioner(threshold=0.35)
+        
+        tags = self.captioner.get_image_tags(img_path)
+        
+        self.tags_text.delete('1.0', tk.END)
+        if tags:
+            self.tags_text.insert('1.0', ", ".join(tags))
+        else:
+            self.tags_text.insert('1.0', "No tags found. Generate captions first.")
     
     def run(self):
         """Run the application"""
